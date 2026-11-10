@@ -2,27 +2,22 @@ import os
 import subprocess
 import time
 import shutil
+import json
 import google.generativeai as genai
 import streamlit as st
-from dotenv import load_dotenv  # <-- Добавляем импорт
+from dotenv import load_dotenv
 
 # ================= ЗАГРУЗКА .ENV =================
-# Ищет файл .env в текущей директории и загружает переменные
 load_dotenv()
-
-# ================= НАСТРОЙКИ =================
-# Читаем переменные из окружения. 
-# Если их нет, можно задать значения по умолчанию или оставить None для отладки
 API_KEY = os.getenv("GCP_API_KEY")
 APP_PASSWORD = os.getenv("ADMIN_PASS")
 
-# Проверка на наличие ключей (опционально, но полезно)
 if not API_KEY:
     raise ValueError("Ошибка: GCP_API_KEY не найден в файле .env")
 if not APP_PASSWORD:
     raise ValueError("Ошибка: ADMIN_PASS не найден в файле .env")
 
-# Список моделей для автоматического перебора
+# Список моделей (Обновите на актуальные, если эти не работают)
 FALLBACK_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.6-flash",
@@ -33,10 +28,11 @@ FALLBACK_MODELS = [
 
 MODEL_SWITCH_DELAY_SECONDS = 1.5
 BASH_TIMEOUT_SECONDS = 120
-MAX_HISTORY_MESSAGES = 20
+MAX_HISTORY_MESSAGES = 30
+HISTORY_FILE = "chat_history.json"
+
 # =============================================
 
-# Настройка страницы
 st.set_page_config(
     page_title="SysAdmin AI Hub",
     page_icon="⚡",
@@ -47,32 +43,27 @@ st.set_page_config(
 # ================= СТИЛИЗАЦИЯ И ДИЗАЙН (CSS) =================
 st.markdown("""
 <style>
-    /* Импорт современного шрифта */
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
     html, body, [class*="css"] {
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
 
-    /* Фон приложения */
     .stApp {
         background: radial-gradient(circle at 50% -20%, #1e1b4b 0%, #0f172a 60%, #090d16 100%);
         color: #f8fafc;
     }
 
-    /* Скрытие дефолтных шапок Streamlit */
     header[data-testid="stHeader"] {
         background: transparent !important;
     }
 
-    /* Боковая панель */
     section[data-testid="stSidebar"] {
         background-color: rgba(15, 23, 42, 0.75) !important;
         backdrop-filter: blur(12px);
         border-right: 1px solid rgba(255, 255, 255, 0.08);
     }
 
-    /* Карточки метрик и статусов */
     .sys-card {
         background: rgba(30, 41, 59, 0.6);
         border: 1px solid rgba(255, 255, 255, 0.1);
@@ -97,7 +88,6 @@ st.markdown("""
         color: #38bdf8;
     }
 
-    /* Заголовок основной */
     .main-title {
         font-size: 2.2rem;
         font-weight: 800;
@@ -116,7 +106,6 @@ st.markdown("""
         margin-bottom: 24px;
     }
 
-    /* Бейдж онлайн статуса */
     .status-badge {
         display: inline-flex;
         align-items: center;
@@ -137,8 +126,7 @@ st.markdown("""
         border-radius: 50%;
         box-shadow: 0 0 8px #10b981;
     }
-
-    /* Сообщения в чате */
+ 
     [data-testid="stChatMessage"] {
         background-color: rgba(30, 41, 59, 0.5) !important;
         border: 1px solid rgba(255, 255, 255, 0.06) !important;
@@ -153,7 +141,6 @@ st.markdown("""
         border: 1px solid rgba(99, 102, 241, 0.25) !important;
     }
 
-    /* Поле ввода */
     div[data-baseweb="input"] {
         border-radius: 14px !important;
         background-color: rgba(30, 41, 59, 0.8) !important;
@@ -165,15 +152,6 @@ st.markdown("""
         box-shadow: 0 0 15px rgba(99, 102, 241, 0.3) !important;
     }
 
-    /* Кнопки быстрых команд */
-    .quick-btn-container {
-        display: flex;
-        gap: 8px;
-        flex-wrap: wrap;
-        margin-bottom: 20px;
-    }
-
-    /* Стилизация кнопок Streamlit */
     .stButton > button {
         border-radius: 10px !important;
         background: rgba(30, 41, 59, 0.7) !important;
@@ -187,7 +165,7 @@ st.markdown("""
         background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%) !important;
         border-color: #818cf8 !important;
         color: #ffffff !important;
-        transform: translateY(-2px);
+        transform: translateY(-2px); 
         box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
     }
 </style>
@@ -196,7 +174,6 @@ st.markdown("""
 
 # ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
 def get_system_stats():
-    """Сбор быстрой статистики сервера без сторонних библиотек"""
     try:
         disk = shutil.disk_usage("/")
         disk_pct = int(disk.used / disk.total * 100)
@@ -265,6 +242,37 @@ def create_chat(model_name: str, history: list):
     )
 
 
+# ================= ЗАГРУЗКА ИСТОРИИ ИЗ ФАЙЛА =================
+def load_history_from_file():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_history_to_file(messages):
+    try:
+        # Сохраняем только последние сообщения
+        recent_msgs = messages[-MAX_HISTORY_MESSAGES:]
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(recent_msgs, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+# Инициализация состояния
+if "messages" not in st.session_state:
+    st.session_state.messages = load_history_from_file()
+
+if "model_cursor" not in st.session_state:
+    st.session_state.model_cursor = 0
+
+if "pending_prompt" not in st.session_state:
+    st.session_state.pending_prompt = None
+
+
 # ================= БОКОВАЯ ПАНЕЛЬ (SIDEBAR) =================
 with st.sidebar:
     st.markdown("### 🔐 Авторизация")
@@ -299,10 +307,10 @@ with st.sidebar:
     st.markdown("### ⚙️ Статус службы")
     st.markdown("""
     <div class="status-badge">
-        <div class="status-dot"></div> Auto-Start Active (Systemd)
+        <div class="status-dot"></div> File Persisted
     </div>
     <div style="font-size:0.75rem; color:#94a3b8; margin-top:8px;">
-        🔄 Изменения в коде применяются автоматически без перезапуска.
+        💾 История чата сохраняется в файл chat_history.json
     </div>
     """, unsafe_allow_html=True)
     
@@ -310,6 +318,7 @@ with st.sidebar:
     if st.button("🗑️ Очистить диалог", use_container_width=True):
         st.session_state.messages = []
         st.session_state.model_cursor = 0
+        save_history_to_file([])
         st.rerun()
 
 
@@ -318,26 +327,15 @@ st.markdown("""
 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
     <div>
         <div class="main-title">🤖 SysAdmin AI Center</div>
-        <div class="subtitle">Управление сервером через ИИ-агента с автоматическим исполнением команд</div>
+        <div class="subtitle">Управление сервером через ИИ-агента с персистентной памятью чата</div>
     </div>
     <div>
         <div class="status-badge">
-            <div class="status-dot"></div> Авто-обновление включено
+            <div class="status-dot"></div> Память активна
         </div>
     </div>
 </div>
 """, unsafe_allow_html=True)
-
-
-# Состояние диалога
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "model_cursor" not in st.session_state:
-    st.session_state.model_cursor = 0
-
-if "pending_prompt" not in st.session_state:
-    st.session_state.pending_prompt = None
 
 
 # Быстрые действия (Quick Presets)
@@ -375,7 +373,7 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 
-# Ввод пользователя (текстом или по кнопке быстрого действия)
+# Ввод пользователя
 user_input = st.chat_input("Напишите задачу (например: установи htop)...")
 
 prompt_to_send = None
@@ -388,6 +386,8 @@ elif st.session_state.pending_prompt:
 
 if prompt_to_send:
     st.session_state.messages.append({"role": "user", "content": prompt_to_send})
+    save_history_to_file(st.session_state.messages)
+    
     with st.chat_message("user", avatar="👤"):
         st.markdown(prompt_to_send)
 
@@ -417,6 +417,8 @@ if prompt_to_send:
                     st.caption(f"🚀 Активная модель: `{model_name}`")
 
                     st.session_state.messages.append({"role": "model", "content": answer})
+                    save_history_to_file(st.session_state.messages)
+                    
                     st.session_state.model_cursor = (original_cursor + offset) % len(FALLBACK_MODELS)
                     answered = True
                     break
