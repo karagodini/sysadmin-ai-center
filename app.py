@@ -1,12 +1,26 @@
+import os
 import subprocess
 import time
 import shutil
 import google.generativeai as genai
 import streamlit as st
+from dotenv import load_dotenv  # <-- Добавляем импорт
+
+# ================= ЗАГРУЗКА .ENV =================
+# Ищет файл .env в текущей директории и загружает переменные
+load_dotenv()
 
 # ================= НАСТРОЙКИ =================
-    api_key = "REPLACE_ME"
-APP_PASSWORD = "babka123"
+# Читаем переменные из окружения. 
+# Если их нет, можно задать значения по умолчанию или оставить None для отладки
+API_KEY = os.getenv("GCP_API_KEY")
+APP_PASSWORD = os.getenv("ADMIN_PASS")
+
+# Проверка на наличие ключей (опционально, но полезно)
+if not API_KEY:
+    raise ValueError("Ошибка: GCP_API_KEY не найден в файле .env")
+if not APP_PASSWORD:
+    raise ValueError("Ошибка: ADMIN_PASS не найден в файле .env")
 
 # Список моделей для автоматического перебора
 FALLBACK_MODELS = [
