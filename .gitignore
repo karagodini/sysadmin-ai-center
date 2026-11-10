@@ -3,3 +3,5 @@ teleport/
 teleport.tar.gz
 venv/
 .env
+__pycache__/
+*.pyc
