@@ -257,41 +257,43 @@ if "pending_prompt" not in st.session_state:
     st.session_state.pending_prompt = None
 
 
+
+# ================= АВТОРИЗАЦИЯ И СТРАНИЦА ВХОДА =================
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.markdown("""
+    <div style="display: flex; justify-content: center; align-items: center; height: 80vh;">
+        <div style="background: var(--bg-card, #1e293b); padding: 40px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.3); width: 100%; max-width: 400px; border: 1px solid rgba(255,255,255,0.1);">
+            <div style="text-align: center; margin-bottom: 24px;">
+                <span style="font-size: 3rem;">🛡️</span>
+                <h2 style="margin: 10px 0 0 0; color: #f8fafc;">SysAdmin AI Center</h2>
+                <p style="color: #94a3b8; font-size: 0.9rem; margin-top: 5px;">Введите учетные данные для доступа</p>
+            </div>
+    """, unsafe_allow_html=True)
+    
+    with st.form("login_form"):
+        login_input = st.text_input("Логин", placeholder="admin")
+        pass_input = st.text_input("Пароль", type="password", placeholder="Введите пароль")
+        submit_btn = st.form_submit_button("Войти", use_container_width=True)
+        
+        if submit_btn:
+            if login_input == "admin" and pass_input == APP_PASSWORD:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("❌ Неверный логин или пароль!")
+                
+    st.markdown("</div></div>", unsafe_allow_html=True)
+    st.stop()
+
 # ================= БОКОВАЯ ПАНЕЛЬ =================
 with st.sidebar:
-    st.markdown("### 🔐 Авторизация")
-    password = st.text_input("Пароль доступа:", type="password", key="app_pwd")
-
-    if password != APP_PASSWORD:
-        st.warning("🔒 Введите пароль для доступа к серверу.")
-        st.stop()
-
-    st.markdown("---")
-    st.markdown("### 🖥️ Мониторинг сервера")
-
-    ram_used, disk_used = get_system_stats()
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown(f"""
-        <div class="sys-card">
-            <div class="metric-label">RAM Нагрузка</div>
-            <div class="metric-value">{ram_used}%</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col2:
-        st.markdown(f"""
-        <div class="sys-card">
-            <div class="metric-label">Диск Занят</div>
-            <div class="metric-value">{disk_used}%</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.markdown("---")
-    st.markdown("""
-    <div class="status-badge">
-        <div class="status-dot"></div> Memory Persisted (PostgreSQL)
-    </div>
-    """, unsafe_allow_html=True)
+    # Кнопка выхода из системы в сайдбаре
+    if st.button("🚪 Выйти из аккаунта", use_container_width=True):
+        st.session_state.authenticated = False
+        st.rerun()
 
     st.markdown("---")
     st.markdown("### 💬 Чаты")
@@ -303,25 +305,25 @@ with st.sidebar:
         st.rerun()
 
     for chat in list_chats():
-        col_a, col_b = st.columns([0.8, 0.2])
-        is_current = chat["id"] == st.session_state.current_chat_id
-        title = chat["title"]
-        display_title = title[:18] + "…" if len(title) > 18 else title
-        with col_a:
+        chat_id = chat["id"]
+        title = chat["title"] or f"Чат #{chat_id}"
+        is_active = chat_id == st.session_state.current_chat_id
+        col_chat, col_del = st.columns([0.8, 0.2])
+        with col_chat:
             if st.button(
-                display_title,
-                key=f"chat_{chat['id']}",
-                type="primary" if is_current else "secondary",
+                title[:25],
+                key=f"chat_{chat_id}",
+                type="primary" if is_active else "secondary",
                 use_container_width=True,
             ):
-                st.session_state.current_chat_id = chat["id"]
-                st.session_state.messages = load_history_from_db(chat["id"])
+                st.session_state.current_chat_id = chat_id
+                st.session_state.messages = load_history_from_db(chat_id)
                 st.session_state.model_cursor = 0
                 st.rerun()
-        with col_b:
-            if st.button("🗑️", key=f"del_{chat['id']}", help="Удалить чат"):
-                delete_chat(chat["id"])
-                if st.session_state.current_chat_id == chat["id"]:
+        with col_del:
+            if st.button("🗑️", key=f"del_{chat_id}", use_container_width=True):
+                delete_chat(chat_id)
+                if st.session_state.current_chat_id == chat_id:
                     remaining = list_chats()
                     if remaining:
                         st.session_state.current_chat_id = remaining[0]["id"]
@@ -330,7 +332,6 @@ with st.sidebar:
                         st.session_state.current_chat_id = create_chat()
                         st.session_state.messages = []
                 st.rerun()
-
 
 # ================= ОСНОВНОЙ ИНТЕРФЕЙС =================
 st.markdown("""
