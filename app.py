@@ -60,30 +60,10 @@ st.markdown("""
     header[data-testid="stHeader"] { background: transparent !important; }
 
     section[data-testid="stSidebar"] {
-        background-color: rgba(15, 23, 42, 0.75) !important;
+        background-color: rgba(15, 23, 42, 0.85) !important;
         backdrop-filter: blur(12px);
         border-right: 1px solid rgba(255, 255, 255, 0.08);
     }
-
-    .sys-card {
-        background: rgba(30, 41, 59, 0.6);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 12px;
-        padding: 14px;
-        margin-bottom: 12px;
-        backdrop-filter: blur(8px);
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
-    }
-
-    .metric-label {
-        font-size: 0.75rem;
-        color: #94a3b8;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        font-weight: 600;
-    }
-
-    .metric-value { font-size: 1.4rem; font-weight: 700; color: #38bdf8; }
 
     .main-title {
         font-size: 2.2rem;
@@ -134,17 +114,6 @@ st.markdown("""
         border: 1px solid rgba(99, 102, 241, 0.25) !important;
     }
 
-    div[data-baseweb="input"] {
-        border-radius: 14px !important;
-        background-color: rgba(30, 41, 59, 0.8) !important;
-        border: 1px solid rgba(255, 255, 255, 0.15) !important;
-    }
-
-    div[data-baseweb="input"]:focus-within {
-        border-color: #6366f1 !important;
-        box-shadow: 0 0 15px rgba(99, 102, 241, 0.3) !important;
-    }
-
     .stButton > button {
         border-radius: 10px !important;
         background: rgba(30, 41, 59, 0.7) !important;
@@ -163,20 +132,6 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
-
-
-def get_system_stats():
-    try:
-        disk = shutil.disk_usage("/")
-        disk_pct = int(disk.used / disk.total * 100)
-        with open('/proc/meminfo') as f:
-            lines = f.readlines()
-        mem_total = int(lines[0].split()[1])
-        mem_avail = int(lines[2].split()[1])
-        ram_pct = int((mem_total - mem_avail) / mem_total * 100)
-        return ram_pct, disk_pct
-    except Exception:
-        return 0, 0
 
 
 def execute_bash(command: str) -> str:
@@ -205,11 +160,6 @@ genai.configure(api_key=API_KEY)
 system_instruction = """
 Ты — умный системный администратор и ИИ-агент, запущенный прямо на Linux-сервере пользователя.
 У тебя есть инструмент `execute_bash`, который позволяет тебе выполнять команды в терминале этого сервера.
-
-Если пользователь просит что-то сделать с файлами, проверить систему, установить пакеты или подключиться по SSH к другому серверу — НЕ пиши просто инструкции, а САМ вызывай функцию `execute_bash`, анализируй вывод и сообщай результат пользователю.
-
-НИКОГДА не изменяй файлы /root/ai-agent/app.py и /root/ai-agent/models.py и не запускай скрипты, которые их модифицируют. Это код твоего собственного интерфейса — ты себя сломаешь.
-
 Общайся на русском языке, кратко и по делу.
 """
 
@@ -243,6 +193,38 @@ def load_history_from_db(chat_id):
 
 
 # ================= СОСТОЯНИЕ =================
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+# ================= СТРАНИЦА ВХОДА =================
+if not st.session_state.authenticated:
+    st.markdown("""
+    <div style="display: flex; justify-content: center; align-items: center; min-height: 80vh;">
+        <div style="background: rgba(30, 41, 59, 0.75); padding: 40px; border-radius: 20px; box-shadow: 0 15px 35px rgba(0,0,0,0.4); width: 100%; max-width: 420px; border: 1px solid rgba(255,255,255,0.12); backdrop-filter: blur(16px);">
+            <div style="text-align: center; margin-bottom: 28px;">
+                <span style="font-size: 3.5rem;">⚡</span>
+                <h2 style="margin: 12px 0 4px 0; color: #f8fafc; font-weight: 700;">SysAdmin AI Center</h2>
+                <p style="color: #94a3b8; font-size: 0.9rem;">Введите учетные данные администратора</p>
+            </div>
+    """, unsafe_allow_html=True)
+
+    with st.form("login_form"):
+        login_input = st.text_input("Логин", placeholder="admin")
+        pass_input = st.text_input("Пароль", type="password", placeholder="••••••••")
+        submit_btn = st.form_submit_button("Войти в систему", use_container_width=True)
+
+        if submit_btn:
+            if login_input == "admin" and pass_input == APP_PASSWORD:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("❌ Неверный логин или пароль!")
+
+    st.markdown("</div></div>", unsafe_allow_html=True)
+    st.stop()
+
+
+# Инициализация чатов после входа
 if "current_chat_id" not in st.session_state:
     chats = list_chats()
     st.session_state.current_chat_id = chats[0]["id"] if chats else create_chat()
@@ -257,41 +239,18 @@ if "pending_prompt" not in st.session_state:
     st.session_state.pending_prompt = None
 
 
-
-# ================= АВТОРИЗАЦИЯ И СТРАНИЦА ВХОДА =================
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    st.markdown("""
-    <div style="display: flex; justify-content: center; align-items: center; height: 80vh;">
-        <div style="background: var(--bg-card, #1e293b); padding: 40px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.3); width: 100%; max-width: 400px; border: 1px solid rgba(255,255,255,0.1);">
-            <div style="text-align: center; margin-bottom: 24px;">
-                <span style="font-size: 3rem;">🛡️</span>
-                <h2 style="margin: 10px 0 0 0; color: #f8fafc;">SysAdmin AI Center</h2>
-                <p style="color: #94a3b8; font-size: 0.9rem; margin-top: 5px;">Введите учетные данные для доступа</p>
-            </div>
-    """, unsafe_allow_html=True)
-    
-    with st.form("login_form"):
-        login_input = st.text_input("Логин", placeholder="admin")
-        pass_input = st.text_input("Пароль", type="password", placeholder="Введите пароль")
-        submit_btn = st.form_submit_button("Войти", use_container_width=True)
-        
-        if submit_btn:
-            if login_input == "admin" and pass_input == APP_PASSWORD:
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("❌ Неверный логин или пароль!")
-                
-    st.markdown("</div></div>", unsafe_allow_html=True)
-    st.stop()
-
-# ================= БОКОВАЯ ПАНЕЛЬ =================
+# ================= БОКОВАЯ ПАНЕЛЬ (ПОСЛЕ ВХОДА) =================
 with st.sidebar:
-    # Кнопка выхода из системы в сайдбаре
-    if st.button("🚪 Выйти из аккаунта", use_container_width=True):
+    st.markdown("""
+    <div style="display: flex; align-items: center; justify-content: space-between; background: rgba(30, 41, 59, 0.6); padding: 10px 14px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.08); margin-bottom: 16px;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 1.2rem;">👤</span>
+            <span style="font-weight: 600; color: #f8fafc; font-size: 0.95rem;">admin</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if st.button("🚪 Выйти из системы", use_container_width=True):
         st.session_state.authenticated = False
         st.rerun()
 
@@ -389,9 +348,7 @@ if prompt_to_send:
         rename_chat(st.session_state.current_chat_id, prompt_to_send[:40])
 
     st.session_state.messages.append({"role": "user", "content": prompt_to_send})
-    print("[AGENT] saving user message to DB...", flush=True)
     save_message(st.session_state.current_chat_id, "user", prompt_to_send)
-    print("[AGENT] user message saved", flush=True)
 
     with st.chat_message("user", avatar="👤"):
         st.markdown(prompt_to_send)
@@ -412,13 +369,11 @@ if prompt_to_send:
             for offset, model_name in enumerate(ordered_models):
                 try:
                     st.write(f"🔄 Обращаюсь к модели `{model_name}`...")
-                    print(f"[AGENT] request -> {model_name}", flush=True)
                     chat_session = create_gemini_chat(model_name, previous_history)
                     response = chat_session.send_message(
                         prompt_to_send,
                         request_options={"timeout": 90},
                     )
-                    print(f"[AGENT] response <- {model_name}", flush=True)
                     answer = (response.text or "").strip()
 
                     if not answer:
@@ -435,7 +390,6 @@ if prompt_to_send:
                     break
 
                 except Exception as e:
-                    print(f"[AGENT] error {model_name}: {e}", flush=True)
                     last_error = e
                     st.warning(f"⚠️ Модель `{model_name}` не ответила: `{e}`. Переключаюсь на резервную...")
                     st.session_state.model_cursor = (original_cursor + offset + 1) % len(FALLBACK_MODELS)
