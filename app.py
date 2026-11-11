@@ -2,13 +2,16 @@ import os
 import subprocess
 import time
 import shutil
-import json
-import google.generativeai as genai
-import streamlit as st
 from dotenv import load_dotenv
 
-# ================= ЗАГРУЗКА .ENV =================
+# ВАЖНО: .env загружается ДО импорта models (там читается DATABASE_URL)
 load_dotenv()
+
+import google.generativeai as genai
+import streamlit as st
+from models import init_db, save_message, load_messages, clear_messages
+
+# ================= НАСТРОЙКИ =================
 API_KEY = os.getenv("GCP_API_KEY")
 APP_PASSWORD = os.getenv("ADMIN_PASS")
 
@@ -17,7 +20,6 @@ if not API_KEY:
 if not APP_PASSWORD:
     raise ValueError("Ошибка: ADMIN_PASS не найден в файле .env")
 
-# Список моделей (Обновите на актуальные, если эти не работают)
 FALLBACK_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.6-flash",
@@ -29,9 +31,9 @@ FALLBACK_MODELS = [
 MODEL_SWITCH_DELAY_SECONDS = 1.5
 BASH_TIMEOUT_SECONDS = 120
 MAX_HISTORY_MESSAGES = 30
-HISTORY_FILE = "chat_history.json"
-
 # =============================================
+
+init_db()
 
 st.set_page_config(
     page_title="SysAdmin AI Hub",
@@ -40,7 +42,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ================= СТИЛИЗАЦИЯ И ДИЗАЙН (CSS) =================
+# ================= СТИЛИЗАЦИЯ (CSS) =================
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -54,9 +56,7 @@ st.markdown("""
         color: #f8fafc;
     }
 
-    header[data-testid="stHeader"] {
-        background: transparent !important;
-    }
+    header[data-testid="stHeader"] { background: transparent !important; }
 
     section[data-testid="stSidebar"] {
         background-color: rgba(15, 23, 42, 0.75) !important;
@@ -82,11 +82,7 @@ st.markdown("""
         font-weight: 600;
     }
 
-    .metric-value {
-        font-size: 1.4rem;
-        font-weight: 700;
-        color: #38bdf8;
-    }
+    .metric-value { font-size: 1.4rem; font-weight: 700; color: #38bdf8; }
 
     .main-title {
         font-size: 2.2rem;
@@ -100,11 +96,7 @@ st.markdown("""
         gap: 12px;
     }
 
-    .subtitle {
-        color: #94a3b8;
-        font-size: 0.95rem;
-        margin-bottom: 24px;
-    }
+    .subtitle { color: #94a3b8; font-size: 0.95rem; margin-bottom: 24px; }
 
     .status-badge {
         display: inline-flex;
@@ -126,7 +118,7 @@ st.markdown("""
         border-radius: 50%;
         box-shadow: 0 0 8px #10b981;
     }
- 
+
     [data-testid="stChatMessage"] {
         background-color: rgba(30, 41, 59, 0.5) !important;
         border: 1px solid rgba(255, 255, 255, 0.06) !important;
@@ -165,7 +157,7 @@ st.markdown("""
         background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%) !important;
         border-color: #818cf8 !important;
         color: #ffffff !important;
-        transform: translateY(-2px); 
+        transform: translateY(-2px);
         box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
     }
 </style>
@@ -177,7 +169,6 @@ def get_system_stats():
     try:
         disk = shutil.disk_usage("/")
         disk_pct = int(disk.used / disk.total * 100)
-        
         with open('/proc/meminfo') as f:
             lines = f.readlines()
         mem_total = int(lines[0].split()[1])
@@ -198,16 +189,17 @@ def execute_bash(command: str) -> str:
             capture_output=True,
             text=True,
             timeout=BASH_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL,
         )
         output = result.stdout
         if result.stderr:
             output += f"\n[ОШИБКИ/STDERR]:\n{result.stderr}"
+        output = output[:20000]  # не переполняем контекст модели
         return output if output.strip() else "Команда выполнена успешно (пустой вывод)."
     except Exception as e:
         return f"Критическая ошибка выполнения: {str(e)}"
 
 
-# Инициализация Gemini API
 genai.configure(api_key=API_KEY)
 
 system_instruction = """
@@ -222,11 +214,8 @@ system_instruction = """
 
 def to_gemini_history(messages: list) -> list:
     return [
-        {
-            "role": message["role"],
-            "parts": [message["content"]],
-        }
-        for message in messages
+        {"role": m["role"], "parts": [m["content"]]}
+        for m in messages
     ]
 
 
@@ -242,29 +231,23 @@ def create_chat(model_name: str, history: list):
     )
 
 
-# ================= ЗАГРУЗКА ИСТОРИИ ИЗ ФАЙЛА =================
-def load_history_from_file():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
-
-def save_history_to_file(messages):
+def load_history_from_db():
+    """Загружает историю из PostgreSQL и нормализует роли под Gemini."""
     try:
-        # Сохраняем только последние сообщения
-        recent_msgs = messages[-MAX_HISTORY_MESSAGES:]
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(recent_msgs, f, ensure_ascii=False)
+        msgs = load_messages()
     except Exception:
-        pass
+        return []
+    normalized = []
+    for m in msgs:
+        # Старые записи заглушки имели роль "assistant" — приводим к "model"
+        role = "model" if m["role"] in ("assistant", "model") else "user"
+        normalized.append({"role": role, "content": m["content"]})
+    return normalized[-MAX_HISTORY_MESSAGES:]
 
 
-# Инициализация состояния
+# ================= СОСТОЯНИЕ =================
 if "messages" not in st.session_state:
-    st.session_state.messages = load_history_from_file()
+    st.session_state.messages = load_history_from_db()
 
 if "model_cursor" not in st.session_state:
     st.session_state.model_cursor = 0
@@ -273,20 +256,19 @@ if "pending_prompt" not in st.session_state:
     st.session_state.pending_prompt = None
 
 
-# ================= БОКОВАЯ ПАНЕЛЬ (SIDEBAR) =================
+# ================= БОКОВАЯ ПАНЕЛЬ =================
 with st.sidebar:
     st.markdown("### 🔐 Авторизация")
     password = st.text_input("Пароль доступа:", type="password", key="app_pwd")
-    
+
     if password != APP_PASSWORD:
         st.warning("🔒 Введите пароль для доступа к серверу.")
         st.stop()
-        
+
     st.markdown("---")
     st.markdown("### 🖥️ Мониторинг сервера")
-    
+
     ram_used, disk_used = get_system_stats()
-    
     col1, col2 = st.columns(2)
     with col1:
         st.markdown(f"""
@@ -307,18 +289,21 @@ with st.sidebar:
     st.markdown("### ⚙️ Статус службы")
     st.markdown("""
     <div class="status-badge">
-        <div class="status-dot"></div> File Persisted
+        <div class="status-dot"></div> Memory Persisted (PostgreSQL)
     </div>
     <div style="font-size:0.75rem; color:#94a3b8; margin-top:8px;">
-        💾 История чата сохраняется в файл chat_history.json
+        🐘 История чата хранится в базе данных PostgreSQL.
     </div>
     """, unsafe_allow_html=True)
-    
+
     st.markdown("---")
     if st.button("🗑️ Очистить диалог", use_container_width=True):
+        try:
+            clear_messages()
+        except Exception as e:
+            st.error(f"Ошибка очистки БД: {e}")
         st.session_state.messages = []
         st.session_state.model_cursor = 0
-        save_history_to_file([])
         st.rerun()
 
 
@@ -327,51 +312,43 @@ st.markdown("""
 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
     <div>
         <div class="main-title">🤖 SysAdmin AI Center</div>
-        <div class="subtitle">Управление сервером через ИИ-агента с персистентной памятью чата</div>
+        <div class="subtitle">Управление сервером через ИИ-агента · история в PostgreSQL</div>
     </div>
     <div>
         <div class="status-badge">
-            <div class="status-dot"></div> Память активна
+            <div class="status-dot"></div> Агент активен
         </div>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-
-# Быстрые действия (Quick Presets)
 st.markdown("##### ⚡ Быстрые команды:")
 q_cols = st.columns(5)
 
 with q_cols[0]:
     if st.button("📊 Статус системы", use_container_width=True):
         st.session_state.pending_prompt = "Покажи текущий статус системы: свободна память, CPU, аптайм и нагрузку."
-
 with q_cols[1]:
     if st.button("💾 Место на диске", use_container_width=True):
         st.session_state.pending_prompt = "Проверь свободное место на всех дисках (df -h) и размер /var/log."
-
 with q_cols[2]:
     if st.button("🔝 Топ CPU/RAM", use_container_width=True):
         st.session_state.pending_prompt = "Покажи топ-5 процессов по использованию CPU и оперативной памяти."
-
 with q_cols[3]:
     if st.button("🔍 Статус служб", use_container_width=True):
-        st.session_state.pending_prompt = "Проверь статус служб nginx и ai-agent на сервере."
-
+        st.session_state.pending_prompt = "Проверь статус служб nginx и streamlit-panel на сервере."
 with q_cols[4]:
     if st.button("📁 Логи системы", use_container_width=True):
-        st.session_state.pending_prompt = "Покажи последние 20 строк из лога journalctl -u ai-agent."
+        st.session_state.pending_prompt = "Покажи последние 20 строк из лога journalctl -u streamlit-panel."
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-
-# Отрисовка истории сообщений
+# Отрисовка истории
 for msg in st.session_state.messages:
-    ui_role = "assistant" if msg["role"] == "model" else msg["role"]
+    ui_role = "assistant" if msg["role"] == "model" else "user"
     avatar = "🤖" if ui_role == "assistant" else "👤"
     with st.chat_message(ui_role, avatar=avatar):
         st.markdown(msg["content"])
-
 
 # Ввод пользователя
 user_input = st.chat_input("Напишите задачу (например: установи htop)...")
@@ -383,11 +360,12 @@ elif st.session_state.pending_prompt:
     prompt_to_send = st.session_state.pending_prompt
     st.session_state.pending_prompt = None
 
-
 if prompt_to_send:
     st.session_state.messages.append({"role": "user", "content": prompt_to_send})
-    save_history_to_file(st.session_state.messages)
-    
+    print("[AGENT] saving user message to DB...", flush=True)
+    save_message("user", prompt_to_send)
+    print("[AGENT] user message saved", flush=True)
+
     with st.chat_message("user", avatar="👤"):
         st.markdown(prompt_to_send)
 
@@ -406,8 +384,14 @@ if prompt_to_send:
 
             for offset, model_name in enumerate(ordered_models):
                 try:
+                    st.write(f"🔄 Обращаюсь к модели `{model_name}`...")
+                    print(f"[AGENT] request -> {model_name}", flush=True)
                     chat = create_chat(model_name, previous_history)
-                    response = chat.send_message(prompt_to_send)
+                    response = chat.send_message(
+                        prompt_to_send,
+                        request_options={"timeout": 90},
+                    )
+                    print(f"[AGENT] response <- {model_name}", flush=True)
                     answer = (response.text or "").strip()
 
                     if not answer:
@@ -417,13 +401,14 @@ if prompt_to_send:
                     st.caption(f"🚀 Активная модель: `{model_name}`")
 
                     st.session_state.messages.append({"role": "model", "content": answer})
-                    save_history_to_file(st.session_state.messages)
-                    
+                    save_message("model", answer)
+
                     st.session_state.model_cursor = (original_cursor + offset) % len(FALLBACK_MODELS)
                     answered = True
                     break
 
                 except Exception as e:
+                    print(f"[AGENT] error {model_name}: {e}", flush=True)
                     last_error = e
                     st.warning(f"⚠️ Модель `{model_name}` не ответила: `{e}`. Переключаюсь на резервную...")
                     st.session_state.model_cursor = (original_cursor + offset + 1) % len(FALLBACK_MODELS)
