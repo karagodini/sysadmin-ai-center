@@ -4,12 +4,14 @@ import time
 import shutil
 from dotenv import load_dotenv
 
-# ВАЖНО: .env загружается ДО импорта models (там читается DATABASE_URL)
 load_dotenv()
 
 import google.generativeai as genai
 import streamlit as st
-from models import init_db, save_message, load_messages, clear_messages
+from models import (
+    init_db, create_chat, list_chats, rename_chat,
+    delete_chat, save_message, load_messages,
+)
 
 # ================= НАСТРОЙКИ =================
 API_KEY = os.getenv("GCP_API_KEY")
@@ -42,7 +44,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ================= СТИЛИЗАЦИЯ (CSS) =================
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -164,7 +165,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
 def get_system_stats():
     try:
         disk = shutil.disk_usage("/")
@@ -194,7 +194,7 @@ def execute_bash(command: str) -> str:
         output = result.stdout
         if result.stderr:
             output += f"\n[ОШИБКИ/STDERR]:\n{result.stderr}"
-        output = output[:20000]  # не переполняем контекст модели
+        output = output[:20000]
         return output if output.strip() else "Команда выполнена успешно (пустой вывод)."
     except Exception as e:
         return f"Критическая ошибка выполнения: {str(e)}"
@@ -208,18 +208,17 @@ system_instruction = """
 
 Если пользователь просит что-то сделать с файлами, проверить систему, установить пакеты или подключиться по SSH к другому серверу — НЕ пиши просто инструкции, а САМ вызывай функцию `execute_bash`, анализируй вывод и сообщай результат пользователю.
 
+НИКОГДА не изменяй файлы /root/ai-agent/app.py и /root/ai-agent/models.py и не запускай скрипты, которые их модифицируют. Это код твоего собственного интерфейса — ты себя сломаешь.
+
 Общайся на русском языке, кратко и по делу.
 """
 
 
 def to_gemini_history(messages: list) -> list:
-    return [
-        {"role": m["role"], "parts": [m["content"]]}
-        for m in messages
-    ]
+    return [{"role": m["role"], "parts": [m["content"]]} for m in messages]
 
 
-def create_chat(model_name: str, history: list):
+def create_gemini_chat(model_name: str, history: list):
     model = genai.GenerativeModel(
         model_name=model_name,
         tools=[execute_bash],
@@ -231,23 +230,25 @@ def create_chat(model_name: str, history: list):
     )
 
 
-def load_history_from_db():
-    """Загружает историю из PostgreSQL и нормализует роли под Gemini."""
+def load_history_from_db(chat_id):
     try:
-        msgs = load_messages()
+        msgs = load_messages(chat_id)
     except Exception:
         return []
     normalized = []
     for m in msgs:
-        # Старые записи заглушки имели роль "assistant" — приводим к "model"
         role = "model" if m["role"] in ("assistant", "model") else "user"
         normalized.append({"role": role, "content": m["content"]})
     return normalized[-MAX_HISTORY_MESSAGES:]
 
 
 # ================= СОСТОЯНИЕ =================
+if "current_chat_id" not in st.session_state:
+    chats = list_chats()
+    st.session_state.current_chat_id = chats[0]["id"] if chats else create_chat()
+
 if "messages" not in st.session_state:
-    st.session_state.messages = load_history_from_db()
+    st.session_state.messages = load_history_from_db(st.session_state.current_chat_id)
 
 if "model_cursor" not in st.session_state:
     st.session_state.model_cursor = 0
@@ -286,25 +287,49 @@ with st.sidebar:
         """, unsafe_allow_html=True)
 
     st.markdown("---")
-    st.markdown("### ⚙️ Статус службы")
     st.markdown("""
     <div class="status-badge">
         <div class="status-dot"></div> Memory Persisted (PostgreSQL)
     </div>
-    <div style="font-size:0.75rem; color:#94a3b8; margin-top:8px;">
-        🐘 История чата хранится в базе данных PostgreSQL.
-    </div>
     """, unsafe_allow_html=True)
 
     st.markdown("---")
-    if st.button("🗑️ Очистить диалог", use_container_width=True):
-        try:
-            clear_messages()
-        except Exception as e:
-            st.error(f"Ошибка очистки БД: {e}")
+    st.markdown("### 💬 Чаты")
+
+    if st.button("➕ Новый чат", use_container_width=True):
+        st.session_state.current_chat_id = create_chat()
         st.session_state.messages = []
         st.session_state.model_cursor = 0
         st.rerun()
+
+    for chat in list_chats():
+        col_a, col_b = st.columns([0.8, 0.2])
+        is_current = chat["id"] == st.session_state.current_chat_id
+        title = chat["title"]
+        display_title = title[:18] + "…" if len(title) > 18 else title
+        with col_a:
+            if st.button(
+                display_title,
+                key=f"chat_{chat['id']}",
+                type="primary" if is_current else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state.current_chat_id = chat["id"]
+                st.session_state.messages = load_history_from_db(chat["id"])
+                st.session_state.model_cursor = 0
+                st.rerun()
+        with col_b:
+            if st.button("🗑️", key=f"del_{chat['id']}", help="Удалить чат"):
+                delete_chat(chat["id"])
+                if st.session_state.current_chat_id == chat["id"]:
+                    remaining = list_chats()
+                    if remaining:
+                        st.session_state.current_chat_id = remaining[0]["id"]
+                        st.session_state.messages = load_history_from_db(remaining[0]["id"])
+                    else:
+                        st.session_state.current_chat_id = create_chat()
+                        st.session_state.messages = []
+                st.rerun()
 
 
 # ================= ОСНОВНОЙ ИНТЕРФЕЙС =================
@@ -343,14 +368,12 @@ with q_cols[4]:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# Отрисовка истории
 for msg in st.session_state.messages:
     ui_role = "assistant" if msg["role"] == "model" else "user"
     avatar = "🤖" if ui_role == "assistant" else "👤"
     with st.chat_message(ui_role, avatar=avatar):
         st.markdown(msg["content"])
 
-# Ввод пользователя
 user_input = st.chat_input("Напишите задачу (например: установи htop)...")
 
 prompt_to_send = None
@@ -361,9 +384,12 @@ elif st.session_state.pending_prompt:
     st.session_state.pending_prompt = None
 
 if prompt_to_send:
+    if not st.session_state.messages:
+        rename_chat(st.session_state.current_chat_id, prompt_to_send[:40])
+
     st.session_state.messages.append({"role": "user", "content": prompt_to_send})
     print("[AGENT] saving user message to DB...", flush=True)
-    save_message("user", prompt_to_send)
+    save_message(st.session_state.current_chat_id, "user", prompt_to_send)
     print("[AGENT] user message saved", flush=True)
 
     with st.chat_message("user", avatar="👤"):
@@ -386,8 +412,8 @@ if prompt_to_send:
                 try:
                     st.write(f"🔄 Обращаюсь к модели `{model_name}`...")
                     print(f"[AGENT] request -> {model_name}", flush=True)
-                    chat = create_chat(model_name, previous_history)
-                    response = chat.send_message(
+                    chat_session = create_gemini_chat(model_name, previous_history)
+                    response = chat_session.send_message(
                         prompt_to_send,
                         request_options={"timeout": 90},
                     )
@@ -401,7 +427,7 @@ if prompt_to_send:
                     st.caption(f"🚀 Активная модель: `{model_name}`")
 
                     st.session_state.messages.append({"role": "model", "content": answer})
-                    save_message("model", answer)
+                    save_message(st.session_state.current_chat_id, "model", answer)
 
                     st.session_state.model_cursor = (original_cursor + offset) % len(FALLBACK_MODELS)
                     answered = True
