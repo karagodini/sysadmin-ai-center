@@ -1,0 +1,42 @@
+[Unit]
+Description=SysAdmin AI Agent Streamlit Panel (ai.ikaragodin.com.ru)
+After=network.target postgresql.service nginx.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=aiagent
+Group=aiagent
+SupplementaryGroups=adm systemd-journal
+WorkingDirectory=/opt/ai-agent
+# Секреты: root-only файл, читается systemd при старте (не лежит в каталоге приложения)
+EnvironmentFile=/etc/ai-agent/ai-agent.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HOME=/var/lib/ai-agent
+StateDirectory=ai-agent
+ExecStart=/opt/ai-agent/venv/bin/streamlit run app.py --server.port=8501 --server.address=127.0.0.1
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+# Hardening. NoNewPrivileges не включён намеренно: иначе не работает узкий sudo-allowlist
+# (/etc/sudoers.d/ai-agent) для nginx -t / перезапуска отдельных служб.
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

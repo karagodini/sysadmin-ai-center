@@ -1,0 +1,7 @@
+# ai.ikaragodin.com.ru agent: narrow allowlist (no blanket sudo)
+Cmnd_Alias AIAGENT_CMDS = /usr/sbin/nginx -t, \
+    /usr/bin/systemctl reload nginx, /usr/bin/systemctl restart nginx, \
+    /usr/bin/systemctl restart portfolio-api, /usr/bin/systemctl restart bravput-app, \
+    /usr/bin/systemctl restart vera-api, /usr/bin/systemctl restart dengi-bot, \
+    /usr/bin/systemctl restart govorun
+aiagent ALL=(root) NOPASSWD: AIAGENT_CMDS

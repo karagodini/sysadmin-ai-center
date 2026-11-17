@@ -1,10 +1,18 @@
 [server]
 address = "127.0.0.1"
 port = 8501
-enableCORS = false
-enableXsrfProtection = true
 headless = true
-runOnSave = true
+runOnSave = false
+fileWatcherType = "none"
+enableCORS = true
+corsAllowedOrigins = ["https://ai.ikaragodin.com.ru"]
+allowedHosts = ["ai.ikaragodin.com.ru", "localhost", "127.0.0.1"]
+enableXsrfProtection = true
+maxUploadSize = 5
+
+[client]
+showErrorDetails = "none"
+toolbarMode = "viewer"
 
 [browser]
 gatherUsageStats = false
