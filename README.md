@@ -20,3 +20,23 @@ Streamlit-панель: чат с Gemini (SDK `google-genai`), который м
   и заменить `ADMIN_PASS_HASH` в `/etc/ai-agent/ai-agent.env`, затем `systemctl restart ai-agent`.
 - Сессия: cookie `aiac_session` на 30 дней (в БД хранится только SHA-256 токена), выход удаляет сессию.
 - 5 неудачных попыток с одного IP за 15 минут → блокировка IP на 15 минут (таблица `login_attempts`).
+
+## Провайдеры и выбор модели
+
+В боковой панели — «🧠 Модель для ответа» (выбор хранится на чат, в `chats.model`).
+Модель, давшая ответ, сохраняется в `chat_messages.model` и показывается под ответом.
+Кнопка «🔁 Ответить заново выбранной моделью» переотвечает на последний вопрос.
+
+| Провайдер | Base URL | Ключ (env) |
+|---|---|---|
+| Google Gemini | google-genai SDK | `GCP_API_KEY` |
+| UnoRouter | `https://api.unorouter.com/v1` | `UNOROUTER_API_KEY` |
+| SambaNova | `https://api.sambanova.ai/v1` | `SAMBANOVA_API_KEY` |
+| OpenCode Zen | `https://opencode.ai/zen/v1` | `OPENCODE_API_KEY` |
+| NVIDIA NIM | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` |
+
+Не-Gemini провайдеры работают через OpenAI-совместимый Chat Completions (`openai` SDK, стриминг, tool calling).
+Режим «авто» — запасные модели только внутри выбранного провайдера и только пока не выполнена ни одна команда;
+конкретная модель — без подмены, ошибка показывается пользователю.
+Провайдеры с пометкой `disabled` в `agent.PROVIDERS` скрыты; включить: `AI_AGENT_ENABLE_PROVIDERS=sambanova,opencode`
+в `/etc/ai-agent/ai-agent.env`. Ключи хранятся только в этом файле (root:root 600), в git их нет.

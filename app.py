@@ -1,4 +1,4 @@
-"""SysAdmin AI Center — Streamlit-панель управления сервером через Gemini."""
+"""SysAdmin AI Center — Streamlit-панель управления сервером через LLM (Gemini и OpenAI-совместимые провайдеры)."""
 import logging
 import sys
 import uuid
@@ -8,8 +8,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import streamlit as st
-from google.genai import types
-
 import agent
 import auth
 import models
@@ -192,8 +190,8 @@ def load_history_from_db(chat_id):
     except Exception:
         logger.exception("load_messages failed")
         return []
-    return [{"role": "model" if m["role"] in ("assistant", "model") else "user", "content": m["content"]}
-            for m in msgs]
+    return [{"role": "model" if m["role"] in ("assistant", "model") else "user", "content": m["content"],
+             "model": m.get("model")} for m in msgs]
 
 
 if "current_chat_id" not in st.session_state:
@@ -201,7 +199,8 @@ if "current_chat_id" not in st.session_state:
     st.session_state.current_chat_id = _chats[0]["id"] if _chats else models.create_chat()
 if "messages" not in st.session_state:
     st.session_state.messages = load_history_from_db(st.session_state.current_chat_id)
-st.session_state.setdefault("model_cursor", 0)
+st.session_state.setdefault("model_cursor", {})
+st.session_state.setdefault("regen", False)
 st.session_state.setdefault("pending_prompt", None)
 st.session_state.setdefault("turn", None)
 
@@ -226,6 +225,38 @@ with st.sidebar:
     if st.button("🚪 Выйти из системы", use_container_width=True):
         auth.logout()
         st.rerun()
+
+    st.markdown("---")
+    st.markdown("### 🧠 Модель для ответа")
+    _cid = st.session_state.current_chat_id
+    _opts = agent.choices()
+    _ids = [c for c, _ in _opts]
+    _labels = dict(_opts)
+    try:
+        _saved = models.get_chat_model(_cid)
+    except Exception:
+        logger.exception("get_chat_model failed")
+        _saved = None
+    _pid, _m = agent.parse_choice(_saved)
+    _cur = f"{_pid}/{_m or 'auto'}"
+
+    def _save_model_choice(chat_id, key):
+        try:
+            models.set_chat_model(chat_id, st.session_state[key])
+        except Exception:
+            logger.exception("set_chat_model failed")
+
+    _key = f"model_sel_{_cid}"
+    st.selectbox("Кто отвечает в этом чате", _ids, index=_ids.index(_cur) if _cur in _ids else 0,
+                 format_func=lambda c: _labels.get(c, c), key=_key, label_visibility="collapsed",
+                 disabled=st.session_state.turn is not None, on_change=_save_model_choice, args=(_cid, _key))
+    st.caption("«авто» — при сбое пробует другую модель того же провайдера (пока не выполнена ни одна команда). "
+               "Конкретная модель — без подмены: при ошибке покажу её.")
+    _off = [(p["label"], agent.provider_status(pid)) for pid, p in agent.PROVIDERS.items() if agent.provider_status(pid)]
+    if _off:
+        with st.expander("Недоступные провайдеры"):
+            for _lbl, _why in _off:
+                st.caption(f"**{_lbl}**: {_why}")
 
     st.markdown("---")
     st.markdown("### 💬 Чаты")
@@ -284,10 +315,16 @@ for col, (label, prompt) in zip(q_cols, QUICK):
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-for msg in st.session_state.messages:
+for _i, msg in enumerate(st.session_state.messages):
     ui_role = "assistant" if msg["role"] == "model" else "user"
     with st.chat_message(ui_role, avatar="🤖" if ui_role == "assistant" else "👤"):
         st.markdown(msg["content"])
+        if ui_role == "assistant" and msg.get("model"):
+            st.caption(f"🚀 Ответила модель: {msg['model']}")
+        if (ui_role == "assistant" and _i == len(st.session_state.messages) - 1
+                and st.session_state.turn is None and _i > 0):
+            if st.button("🔁 Ответить заново выбранной моделью", key=f"regen_{st.session_state.current_chat_id}_{_i}"):
+                st.session_state.regen = True
 
 
 # ================= ЛОГИКА ХОДА АГЕНТА =================
@@ -349,8 +386,7 @@ def process_batch(turn):
             waiting = True
     if waiting:
         return False
-    parts = [agent.function_response_part(e["call"], e["payload"]) for e in turn["batch"]]
-    turn["contents"].append(types.Content(role="user", parts=parts))
+    agent.append_tool_results(turn["provider"], turn["contents"], [(e["call"], e["payload"]) for e in turn["batch"]])
     turn["batch"] = None
     return True
 
@@ -377,14 +413,13 @@ def finish_turn(turn, extra=None):
         turn["log"].append(extra)
         st.markdown(extra)
     content = "\n\n".join(turn["log"]).strip() or "(нет ответа)"
-    if turn.get("last_model"):
-        content += f"\n\n_🚀 Модель: `{turn['last_model']}`_"
+    label = agent.model_label(turn["provider"], turn["last_model"]) if turn.get("last_model") else None
     try:
-        models.save_message(turn["chat_id"], "model", content)
+        models.save_message(turn["chat_id"], "model", content, label)
     except Exception:
         logger.exception("save_message failed")
     if turn["chat_id"] == st.session_state.current_chat_id:
-        st.session_state.messages.append({"role": "model", "content": content})
+        st.session_state.messages.append({"role": "model", "content": content, "model": label})
     st.session_state.turn = None
 
 
@@ -396,49 +431,59 @@ def run_turn(turn):
 
     while turn["rounds"] < agent.MAX_TOOL_ROUNDS:
         turn["rounds"] += 1
+        pid = turn["provider"]
+        pool = agent.provider_models(pid)
         if turn["model"]:
             candidates = [turn["model"]]
+        elif turn["fixed"]:
+            candidates = [turn["fixed"]]
         else:
-            cur = st.session_state.model_cursor
-            candidates = agent.FALLBACK_MODELS[cur:] + agent.FALLBACK_MODELS[:cur]
+            cur = st.session_state.model_cursor.get(pid, 0) % len(pool)
+            candidates = pool[cur:] + pool[:cur]
 
         result = None
         for model_name in candidates:
             ph = st.empty()
             try:
-                with st.spinner(f"⚡ Думаю… (`{model_name}`)"):
-                    parts, text = agent.stream_once(model_name, turn["contents"],
-                                                    lambda t, _ph=ph: _ph.markdown(t + " ▌"))
+                with st.spinner(f"⚡ Думаю… (`{agent.model_label(pid, model_name)}`)"):
+                    raw, text, calls = agent.stream_once(pid, model_name, turn["contents"],
+                                                         lambda t, _ph=ph: _ph.markdown(t + " ▌"))
                 if text.strip():
                     ph.markdown(text)
                 else:
                     ph.empty()
-                result = (model_name, parts, text)
+                result = (model_name, raw, text, calls)
                 break
             except Exception as exc:
-                logger.warning("model %s failed (tool_executed=%s): %s: %s", model_name, turn["tool_executed"],
-                               type(exc).__name__, str(exc)[:300])
+                err = agent.short_error(exc)
+                logger.warning("model %s/%s failed (tool_executed=%s): %s", pid, model_name, turn["tool_executed"], err)
                 ph.empty()
                 if turn["tool_executed"]:
-                    finish_turn(turn, f"❌ Модель `{model_name}` не ответила после выполнения команд. "
-                                      "Чтобы не выполнять команды повторно, запрос остановлен — "
-                                      "уточните задачу новым сообщением.")
+                    finish_turn(turn, f"❌ Модель `{agent.model_label(pid, model_name)}` не ответила после выполнения "
+                                      "команд. Чтобы не выполнять команды повторно, запрос остановлен — "
+                                      f"уточните задачу новым сообщением.\n\nОшибка: `{_safe_block(err)}`")
+                    return True
+                if turn["fixed"]:
+                    finish_turn(turn, f"❌ Выбранная модель `{agent.model_label(pid, model_name)}` не ответила. "
+                                      "Другую модель без вашего выбора не подставляю — выберите другую в боковой "
+                                      f"панели или нажмите «Ответить заново».\n\nОшибка: `{_safe_block(err)}`")
                     return True
                 st.caption(f"⚠️ Модель `{model_name}` сейчас недоступна, пробую следующую…")
-                st.session_state.model_cursor = (agent.FALLBACK_MODELS.index(model_name) + 1) % len(agent.FALLBACK_MODELS)
+                st.session_state.model_cursor[pid] = (pool.index(model_name) + 1) % len(pool)
 
         if result is None:
-            finish_turn(turn, "❌ Не удалось получить ответ ни от одной модели. Попробуйте позже.")
+            finish_turn(turn, f"❌ Не удалось получить ответ ни от одной модели {agent.PROVIDERS[pid]['label']}. "
+                              "Попробуйте позже или выберите другого провайдера.")
             return True
 
-        model_name, parts, text = result
+        model_name, raw, text, calls = result
         turn["last_model"] = model_name
-        st.session_state.model_cursor = agent.FALLBACK_MODELS.index(model_name)
-        turn["contents"].append(types.Content(role="model", parts=parts))
+        if not turn["fixed"]:
+            st.session_state.model_cursor[pid] = pool.index(model_name)
+        agent.append_assistant(pid, turn["contents"], raw)
         if text.strip():
             turn["log"].append(text.strip())
 
-        calls = [p.function_call for p in parts if p.function_call]
         if not calls:
             finish_turn(turn)
             return True
@@ -446,7 +491,7 @@ def run_turn(turn):
         batch = []
         for call in calls:
             cmd, reason = agent.call_args(call)
-            if call.name != "run_shell" or not cmd:
+            if call.name != agent.RUN_SHELL.name or not cmd:
                 batch.append({"call": call, "command": cmd or "", "auto": False, "why": "",
                               "payload": {"error": "Неизвестный инструмент или пустая команда."}})
                 continue
@@ -463,16 +508,22 @@ def run_turn(turn):
 
 
 # ================= ВВОД =================
+_sel_pid, _sel_model = agent.parse_choice(st.session_state.get(f"model_sel_{st.session_state.current_chat_id}"))
+st.caption(f"🧠 Ответит: **{agent.PROVIDERS[_sel_pid]['label']} · {_sel_model or 'авто'}** — сменить можно в боковой панели")
 user_input = st.chat_input("Напишите задачу (например: проверь место на диске)...",
                            disabled=st.session_state.turn is not None, max_chars=8000)
 prompt_to_send = None
-if user_input:
+if user_input and st.session_state.turn is not None:
+    st.toast("⏳ Дождитесь окончания текущего ответа — сообщение не отправлено.")
+elif user_input:
     prompt_to_send = user_input
 elif st.session_state.pending_prompt and st.session_state.turn is None:
     prompt_to_send = st.session_state.pending_prompt
     st.session_state.pending_prompt = None
 
+history = None
 if prompt_to_send and st.session_state.turn is None:
+    st.session_state.regen = False
     chat_id = st.session_state.current_chat_id
     if not st.session_state.messages:
         models.rename_chat(chat_id, prompt_to_send[:40])
@@ -481,10 +532,24 @@ if prompt_to_send and st.session_state.turn is None:
     with st.chat_message("user", avatar="👤"):
         st.markdown(prompt_to_send)
     history = st.session_state.messages[-MAX_HISTORY_MESSAGES:]
+elif st.session_state.regen and st.session_state.turn is None:
+    # «Ответить заново»: тот же последний вопрос, прежний ответ остаётся в истории чата, но модели не передаётся
+    st.session_state.regen = False
+    _msgs = st.session_state.messages
+    _last_user = max((i for i, m in enumerate(_msgs) if m["role"] == "user"), default=None)
+    if _last_user is not None:
+        history = _msgs[:_last_user + 1][-MAX_HISTORY_MESSAGES:]
+
+if history is not None:
+    chat_id = st.session_state.current_chat_id
+    _choice = st.session_state.get(f"model_sel_{chat_id}") or models.get_chat_model(chat_id)
+    _pid, _fixed = agent.parse_choice(_choice)
     st.session_state.turn = {
         "id": uuid.uuid4().hex[:12],
         "chat_id": chat_id,
-        "contents": agent.history_to_contents(history),
+        "provider": _pid,
+        "fixed": _fixed,
+        "contents": agent.history_to_contents(_pid, history),
         "model": None,
         "last_model": None,
         "tool_executed": False,
@@ -492,6 +557,9 @@ if prompt_to_send and st.session_state.turn is None:
         "log": [],
         "rounds": 0,
     }
+    # Сразу перерисовываем страницу: поле ввода и кнопки станут неактивными на всё время ответа,
+    # иначе новое сообщение, отправленное во время стриминга, прерывало бы ход и терялось.
+    st.rerun()
 
 turn = st.session_state.turn
 if turn is not None:

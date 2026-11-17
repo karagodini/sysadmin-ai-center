@@ -124,6 +124,9 @@ def init_db():
                 exit_code INTEGER,
                 duration_ms INTEGER
             )""")
+        # выбор модели на чат и модель, ответившая на сообщение
+        cur.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS model TEXT")
+        cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS model TEXT")
     _init_done = True
 
 
@@ -150,16 +153,29 @@ def delete_chat(chat_id):
         cur.execute("DELETE FROM chats WHERE id = %s", (chat_id,))
 
 
-def save_message(chat_id, role, content):
+def get_chat_model(chat_id):
     with db() as cur:
-        cur.execute("INSERT INTO chat_messages (chat_id, role, content) VALUES (%s, %s, %s)", (chat_id, role, content))
+        cur.execute("SELECT model FROM chats WHERE id = %s", (chat_id,))
+        row = cur.fetchone()
+        return row["model"] if row else None
+
+
+def set_chat_model(chat_id, model):
+    with db() as cur:
+        cur.execute("UPDATE chats SET model = %s WHERE id = %s", (model, chat_id))
+
+
+def save_message(chat_id, role, content, model=None):
+    with db() as cur:
+        cur.execute("INSERT INTO chat_messages (chat_id, role, content, model) VALUES (%s, %s, %s, %s)",
+                    (chat_id, role, content, model))
         cur.execute("UPDATE chats SET updated_at = CURRENT_TIMESTAMP WHERE id = %s", (chat_id,))
 
 
 def load_messages(chat_id):
     with db() as cur:
-        cur.execute("SELECT role, content FROM chat_messages WHERE chat_id = %s ORDER BY id ASC", (chat_id,))
-        return [{"role": r["role"], "content": r["content"]} for r in cur.fetchall()]
+        cur.execute("SELECT role, content, model FROM chat_messages WHERE chat_id = %s ORDER BY id ASC", (chat_id,))
+        return [{"role": r["role"], "content": r["content"], "model": r["model"]} for r in cur.fetchall()]
 
 
 # ---------- сессии входа ----------
