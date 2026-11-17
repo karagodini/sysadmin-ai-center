@@ -15,12 +15,14 @@ import shell_exec
 
 log = logging.getLogger("ai-agent")
 
+# Порядок для «авто»: сначала Flash-Lite — на бесплатном тарифе у них ~500 запросов/день и они быстрые,
+# у 3.8/3.6 Flash и 4-hydrogen ~20/день и они часто перегружены (503/таймауты).
 FALLBACK_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
+    "gemini-3.8-flash",
     "gemini-4-hydrogen",
+    "gemini-3.6-flash",
 ]
 MAX_TOOL_ROUNDS = 8
 MAX_AUTO_CANDIDATES = 4  # сколько моделей пробовать за один шаг в режиме «авто»
@@ -213,6 +215,40 @@ def short_error(exc):
     return msg[:300]
 
 
+class ModelBlocked(RuntimeError):
+    """Провайдер отказался обрабатывать запрос (фильтр). Другие модели того же провайдера не помогут."""
+
+
+def classify_error(exc):
+    """-> (kind, retry_after_s|None, понятная причина). kind: blocked | rate | busy | error."""
+    from google.genai import errors as gerr
+    if isinstance(exc, ModelBlocked):
+        return "blocked", None, str(exc)
+    if isinstance(exc, openai.RateLimitError):
+        return "rate", _retry_after(exc), "лимит запросов бесплатного тарифа (429)"
+    if isinstance(exc, openai.APIStatusError) and exc.status_code in (502, 503, 504):
+        return "busy", None, f"провайдер перегружен ({exc.status_code})"
+    if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError)):
+        return "busy", None, "нет ответа от провайдера (таймаут/сеть)"
+    if isinstance(exc, openai.APIStatusError):
+        return "error", None, f"ошибка провайдера ({exc.status_code})"
+    if isinstance(exc, gerr.APIError):
+        code = getattr(exc, "code", None)
+        if code == 429:
+            delay = None
+            m = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+)", str(exc))
+            if m:
+                delay = float(m.group(1))
+            return "rate", delay, "исчерпан лимит/квота Gemini (429)"
+        if code in (500, 502, 503, 504):
+            return "busy", None, f"Gemini перегружен ({code})"
+        return "error", None, f"ошибка Gemini ({code})"
+    name = type(exc).__name__
+    if "Timeout" in name:
+        return "busy", None, "нет ответа от провайдера (таймаут)"
+    return "error", None, str(exc)[:150]
+
+
 class ToolCall:
     """Единый вид вызова инструмента для всех провайдеров."""
     def __init__(self, id, name, args, raw=None):
@@ -243,10 +279,16 @@ def _gemini_config():
 
 def _gemini_stream(model, contents, on_text):
     parts, text = [], ""
+    block, finish = None, None
     for chunk in _gemini().models.generate_content_stream(model=model, contents=contents, config=_gemini_config()):
+        pf = getattr(chunk, "prompt_feedback", None)
+        if pf is not None and getattr(pf, "block_reason", None):
+            block = pf.block_reason
         if not chunk.candidates:
             continue
         cand = chunk.candidates[0]
+        if cand.finish_reason:
+            finish = cand.finish_reason
         if not cand.content or not cand.content.parts:
             continue
         for p in cand.content.parts:
@@ -255,7 +297,12 @@ def _gemini_stream(model, contents, on_text):
                 text += p.text
                 on_text(text)
     if not parts:
-        raise RuntimeError("пустой ответ модели")
+        if block:
+            name = getattr(block, "value", None) or str(block)
+            raise ModelBlocked(f"Google отклонил запрос фильтром безопасности Gemini ({name})")
+        if finish and getattr(finish, "value", str(finish)) not in ("STOP",):
+            raise RuntimeError(f"Gemini завершил ответ без текста (finish_reason={getattr(finish, 'value', finish)})")
+        raise RuntimeError("Gemini вернул пустой ответ")
     calls = [ToolCall(p.function_call.id, p.function_call.name, dict(p.function_call.args or {}), p.function_call)
              for p in parts if p.function_call]
     return parts, text, calls
@@ -351,7 +398,7 @@ def _openai_stream(pid, model, messages, on_text, wait_rate_limit=True):
         raw_calls.append(raw)
         calls.append(ToolCall(cid, e["name"], args, raw))
     if not text and not calls:
-        raise RuntimeError("пустой ответ модели")
+        raise RuntimeError("модель вернула пустой ответ")
     msg = {"role": "assistant", "content": text or None}
     if raw_calls:
         msg["tool_calls"] = raw_calls

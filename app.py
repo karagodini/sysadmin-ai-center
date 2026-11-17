@@ -1,6 +1,7 @@
 """SysAdmin AI Center — Streamlit-панель управления сервером через LLM (Gemini и OpenAI-совместимые провайдеры)."""
 import logging
 import sys
+import time
 import uuid
 
 from dotenv import load_dotenv
@@ -423,6 +424,31 @@ def finish_turn(turn, extra=None):
     st.session_state.turn = None
 
 
+def _auto_candidates(pid):
+    pool = agent.provider_models(pid)
+    cur = st.session_state.model_cursor.get(pid, 0) % len(pool)
+    return [(pid, m) for m in (pool[cur:] + pool[:cur])[:agent.MAX_AUTO_CANDIDATES]]
+
+
+def clean_history(msgs):
+    """Убирает из контекста сообщения об ошибках и вопросы, на которые так и не было ответа
+    (например, отклонённые фильтром), — иначе один заблокированный вопрос ломает весь чат."""
+    out, n = [], len(msgs)
+    for i, m in enumerate(msgs):
+        if m["role"] != "user":
+            if not (m.get("content") or "").lstrip().startswith("❌"):
+                out.append(m)
+            continue
+        j, answered = i + 1, False
+        while j < n and msgs[j]["role"] != "user":
+            if not (msgs[j].get("content") or "").lstrip().startswith("❌"):
+                answered = True
+            j += 1
+        if answered or i == max(k for k, x in enumerate(msgs) if x["role"] == "user"):
+            out.append(m)
+    return out
+
+
 def run_turn(turn):
     """Двигает ход агента. True — ход завершён, False — ждём подтверждения."""
     if turn["batch"] is not None and not process_batch(turn):
@@ -432,55 +458,91 @@ def run_turn(turn):
     while turn["rounds"] < agent.MAX_TOOL_ROUNDS:
         turn["rounds"] += 1
         pid = turn["provider"]
-        pool = agent.provider_models(pid)
         if turn["model"]:
-            candidates = [turn["model"]]
+            candidates = [(pid, turn["model"])]
         elif turn["fixed"]:
-            candidates = [turn["fixed"]]
+            candidates = [(pid, turn["fixed"])]
         else:
-            cur = st.session_state.model_cursor.get(pid, 0) % len(pool)
-            candidates = (pool[cur:] + pool[:cur])[:agent.MAX_AUTO_CANDIDATES]
+            candidates = _auto_candidates(pid)
+            # Другие провайдеры — только на первом шаге, пока модель ещё ничего не вызывала
+            if turn["rounds"] == 1 and turn.get("history") is not None:
+                for other in agent.PROVIDERS:
+                    if other != pid and not agent.provider_status(other):
+                        candidates += _auto_candidates(other)[:2]
+        single = len(candidates) == 1
 
-        result = None
-        for model_name in candidates:
-            ph = st.empty()
-            try:
-                with st.spinner(f"⚡ Думаю… (`{agent.model_label(pid, model_name)}`)"):
-                    # в «авто» до выполнения команд при лимите сразу берём следующую модель, иначе ждём Retry-After
-                    raw, text, calls = agent.stream_once(pid, model_name, turn["contents"],
-                                                         lambda t, _ph=ph: _ph.markdown(t + " ▌"),
-                                                         wait_rate_limit=bool(turn["model"] or turn["fixed"]))
-                if text.strip():
-                    ph.markdown(text)
-                else:
+        result, failures, waited, attempt = None, [], False, candidates
+        while result is None:
+            retry, blocked = [], set()
+            for cpid, model_name in attempt:
+                if cpid in blocked:
+                    continue
+                contents = turn["contents"] if cpid == pid else agent.history_to_contents(cpid, turn["history"])
+                ph = st.empty()
+                try:
+                    with st.spinner(f"⚡ Думаю… (`{agent.model_label(cpid, model_name)}`)"):
+                        # в «авто» при лимите сразу берём следующую модель; ждём Retry-After только для одной модели
+                        raw, text, calls = agent.stream_once(cpid, model_name, contents,
+                                                             lambda t, _ph=ph: _ph.markdown(t + " ▌"),
+                                                             wait_rate_limit=single)
+                    if text.strip():
+                        ph.markdown(text)
+                    else:
+                        ph.empty()
+                    result = (cpid, model_name, raw, text, calls, contents)
+                    break
+                except Exception as exc:
+                    kind, ra, why = agent.classify_error(exc)
+                    logger.warning("model %s/%s failed (tool_executed=%s, kind=%s): %s", cpid, model_name,
+                                   turn["tool_executed"], kind, agent.short_error(exc))
                     ph.empty()
-                result = (model_name, raw, text, calls)
+                    label = agent.model_label(cpid, model_name)
+                    if turn["tool_executed"]:
+                        finish_turn(turn, f"❌ Модель `{label}` не ответила после выполнения команд: {why}. "
+                                          "Чтобы не выполнять команды повторно, запрос остановлен — "
+                                          "уточните задачу новым сообщением.")
+                        return True
+                    if single:
+                        hint = (" Этот запрос Gemini не пропускает — выберите модель UnoRouter."
+                                if kind == "blocked" else "")
+                        finish_turn(turn, f"❌ Модель `{label}` не ответила: {why}.{hint} Другую модель без "
+                                          "вашего выбора не подставляю — выберите другую в боковой панели "
+                                          "или нажмите «Ответить заново».")
+                        return True
+                    failures.append((label, why))
+                    if kind == "blocked":
+                        blocked.add(cpid)
+                        st.caption(f"⚠️ {why} — пробую другого провайдера…")
+                    else:
+                        st.caption(f"⚠️ `{label}`: {why}, пробую следующую…")
+                    if kind in ("rate", "busy"):
+                        retry.append(((cpid, model_name), ra if ra else (20 if kind == "busy" else 60)))
+                    pool = agent.provider_models(cpid)
+                    if model_name in pool:
+                        st.session_state.model_cursor[cpid] = (pool.index(model_name) + 1) % len(pool)
+            if result is not None or waited or not retry:
                 break
-            except Exception as exc:
-                err = agent.short_error(exc)
-                logger.warning("model %s/%s failed (tool_executed=%s): %s", pid, model_name, turn["tool_executed"], err)
-                ph.empty()
-                if turn["tool_executed"]:
-                    finish_turn(turn, f"❌ Модель `{agent.model_label(pid, model_name)}` не ответила после выполнения "
-                                      "команд. Чтобы не выполнять команды повторно, запрос остановлен — "
-                                      f"уточните задачу новым сообщением.\n\nОшибка: `{_safe_block(err)}`")
-                    return True
-                if turn["fixed"]:
-                    finish_turn(turn, f"❌ Выбранная модель `{agent.model_label(pid, model_name)}` не ответила. "
-                                      "Другую модель без вашего выбора не подставляю — выберите другую в боковой "
-                                      f"панели или нажмите «Ответить заново».\n\nОшибка: `{_safe_block(err)}`")
-                    return True
-                st.caption(f"⚠️ Модель `{model_name}` сейчас недоступна, пробую следующую…")
-                st.session_state.model_cursor[pid] = (pool.index(model_name) + 1) % len(pool)
+            waited = True
+            wait_s = int(max(5, min(60, min(r for _, r in retry))))
+            status = st.empty()
+            for left in range(wait_s, 0, -1):
+                status.info(f"⏳ Все модели сейчас упёрлись в лимит или заняты — жду {left} с и повторю…")
+                time.sleep(1)
+            status.empty()
+            attempt = [c for c, _ in retry]
 
         if result is None:
-            finish_turn(turn, f"❌ Не удалось получить ответ ни от одной из моделей {agent.PROVIDERS[pid]['label']} "
-                              f"({', '.join(candidates)}). Попробуйте позже или выберите другого провайдера.")
+            reasons = "\n".join(f"- `{lbl}`: {why}" for lbl, why in failures[-8:])
+            finish_turn(turn, "❌ Не удалось получить ответ ни от одной модели. Попробуйте позже или выберите "
+                              f"другую модель в боковой панели.\n\n{reasons}")
             return True
 
-        model_name, raw, text, calls = result
+        cpid, model_name, raw, text, calls, contents = result
+        if cpid != pid:
+            turn["provider"], turn["contents"], pid = cpid, contents, cpid
         turn["last_model"] = model_name
-        if not turn["fixed"]:
+        pool = agent.provider_models(pid)
+        if not turn["fixed"] and model_name in pool:
             st.session_state.model_cursor[pid] = pool.index(model_name)
         agent.append_assistant(pid, turn["contents"], raw)
         if text.strip():
@@ -543,6 +605,7 @@ elif st.session_state.regen and st.session_state.turn is None:
         history = _msgs[:_last_user + 1][-MAX_HISTORY_MESSAGES:]
 
 if history is not None:
+    history = clean_history(history)
     chat_id = st.session_state.current_chat_id
     _choice = st.session_state.get(f"model_sel_{chat_id}") or models.get_chat_model(chat_id)
     _pid, _fixed = agent.parse_choice(_choice)
@@ -551,6 +614,7 @@ if history is not None:
         "chat_id": chat_id,
         "provider": _pid,
         "fixed": _fixed,
+        "history": history,
         "contents": agent.history_to_contents(_pid, history),
         "model": None,
         "last_model": None,
