@@ -439,15 +439,17 @@ def run_turn(turn):
             candidates = [turn["fixed"]]
         else:
             cur = st.session_state.model_cursor.get(pid, 0) % len(pool)
-            candidates = pool[cur:] + pool[:cur]
+            candidates = (pool[cur:] + pool[:cur])[:agent.MAX_AUTO_CANDIDATES]
 
         result = None
         for model_name in candidates:
             ph = st.empty()
             try:
                 with st.spinner(f"⚡ Думаю… (`{agent.model_label(pid, model_name)}`)"):
+                    # в «авто» до выполнения команд при лимите сразу берём следующую модель, иначе ждём Retry-After
                     raw, text, calls = agent.stream_once(pid, model_name, turn["contents"],
-                                                         lambda t, _ph=ph: _ph.markdown(t + " ▌"))
+                                                         lambda t, _ph=ph: _ph.markdown(t + " ▌"),
+                                                         wait_rate_limit=bool(turn["model"] or turn["fixed"]))
                 if text.strip():
                     ph.markdown(text)
                 else:
@@ -472,8 +474,8 @@ def run_turn(turn):
                 st.session_state.model_cursor[pid] = (pool.index(model_name) + 1) % len(pool)
 
         if result is None:
-            finish_turn(turn, f"❌ Не удалось получить ответ ни от одной модели {agent.PROVIDERS[pid]['label']}. "
-                              "Попробуйте позже или выберите другого провайдера.")
+            finish_turn(turn, f"❌ Не удалось получить ответ ни от одной из моделей {agent.PROVIDERS[pid]['label']} "
+                              f"({', '.join(candidates)}). Попробуйте позже или выберите другого провайдера.")
             return True
 
         model_name, raw, text, calls = result

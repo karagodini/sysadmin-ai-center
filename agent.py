@@ -20,9 +20,10 @@ FALLBACK_MODELS = [
     "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
-    "gemini-4-argon",
+    "gemini-4-hydrogen",
 ]
 MAX_TOOL_ROUNDS = 8
+MAX_AUTO_CANDIDATES = 4  # сколько моделей пробовать за один шаг в режиме «авто»
 REQUEST_TIMEOUT_MS = 60_000
 
 SUDO_ALLOWED = (
@@ -86,13 +87,23 @@ PROVIDERS = {
         "base_url": "https://api.unorouter.com/v1",
         "key_env": "UNOROUTER_API_KEY",
         "models": [
-            ("gpt-oss-120b:free", "GPT-OSS 120B (free)"),
+            # проверены 17.11.2026 (ответ + вызов инструмента); лимит UnoRouter на free: 1 или 5 запросов/мин на модель
+            ("gpt-oss-120b:free", "GPT-OSS 120B (free, 5/мин)"),
+            ("mistral-small-3.2:free", "Mistral Small 3.2 (free, 5/мин, медленная)"),
             ("gemini-3-flash:free", "Gemini 3 Flash (free)"),
+            ("agnes-3.0-flash:free", "Agnes 3.0 Flash (free)"),
+            ("codestral-latest:free", "Codestral (free)"),
+            ("agnes-2.5-flash:free", "Agnes 2.5 Flash (free)"),
             ("gpt-6-luna:free", "GPT-6 Luna (free)"),
             ("minimax-m3.1-flash:free", "MiniMax M3.1 Flash (free)"),
             ("gemini-3.6-flash:free", "Gemini 3.6 Flash (free)"),
-            ("mistral-small-3.2:free", "Mistral Small 3.2 (free, медленная)"),
-            ("gemma-4-31b-it:free", "Gemma 4 31B (free, медленная)"),
+            ("gemma-4-31b-it:free", "Gemma 4 31B (free, 5/мин, медленная)"),
+            # открыты согласием на unorouter.com/consents; вызов инструментов ещё не проверен
+            ("deepseek-v4.1-flash:free", "DeepSeek V4.1 Flash (free, не проверена)"),
+            ("qwen3.7-flash:free", "Qwen 3.7 Flash (free, не проверена)"),
+            ("glm-5.3-flash:free", "GLM-5.3 Flash (free, не проверена)"),
+            ("llama-3.3-70b:free", "Llama 3.3 70B (free, 5/мин, не проверена)"),
+            ("nemotron-3-super-120b-a12b:free", "Nemotron 3 Super 120B (free, 5/мин, не проверена)"),
         ],
     },
     "sambanova": {
@@ -282,7 +293,7 @@ def _retry_after(exc):
     return float(m.group(1)) if m else None
 
 
-def _openai_create(pid, model, messages, on_text):
+def _openai_create(pid, model, messages, on_text, wait_rate_limit=True):
     """Запрос со стримингом. При 429 с коротким ожиданием (free-тарифы: 1 запрос/мин) ждём и повторяем
     ту же модель один раз — запрос был отклонён целиком, поэтому команды при этом не повторяются."""
     kw = dict(model=model, messages=messages, tools=[OA_TOOL], tool_choice="auto", stream=True)
@@ -290,7 +301,7 @@ def _openai_create(pid, model, messages, on_text):
         return _openai(pid).chat.completions.create(**kw)
     except openai.RateLimitError as exc:
         wait = _retry_after(exc)
-        if wait is None or wait > MAX_RATE_WAIT_S:
+        if not wait_rate_limit or wait is None or wait > MAX_RATE_WAIT_S:
             raise
         log.info("rate limit on %s/%s, waiting %.0fs", pid, model, wait)
         on_text(f"⏳ Лимит бесплатного тарифа `{model}` — жду {int(wait) + 1} с и повторяю запрос…")
@@ -298,8 +309,8 @@ def _openai_create(pid, model, messages, on_text):
         return _openai(pid).chat.completions.create(**kw)
 
 
-def _openai_stream(pid, model, messages, on_text):
-    stream = _openai_create(pid, model, messages, on_text)
+def _openai_stream(pid, model, messages, on_text, wait_rate_limit=True):
+    stream = _openai_create(pid, model, messages, on_text, wait_rate_limit)
     text, tcs = "", {}
     for chunk in stream:
         if not chunk.choices:
@@ -362,11 +373,11 @@ def history_to_contents(pid, messages):
     return out
 
 
-def stream_once(pid, model, contents, on_text):
+def stream_once(pid, model, contents, on_text, wait_rate_limit=True):
     """Один запрос со стримингом. Возвращает (assistant_raw, text, [ToolCall]). Исключения пробрасываются."""
     if PROVIDERS[pid]["kind"] == "gemini":
         return _gemini_stream(model, contents, on_text)
-    return _openai_stream(pid, model, contents, on_text)
+    return _openai_stream(pid, model, contents, on_text, wait_rate_limit)
 
 
 def append_assistant(pid, contents, raw):
